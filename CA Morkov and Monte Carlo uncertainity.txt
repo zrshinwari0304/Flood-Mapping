@@ -1,0 +1,190 @@
+# === MAIN ===
+input_dir = r"G:\Ph.D Research Work\3rd Paper database\Zahid\Landcover\Landcover prediction data\Landcover prediction data"
+output_dir = r"G:\Ph.D Research Work\3rd Paper database\Zahid\Landcover\Landcover prediction data\Simulations"
+os.makedirs(output_dir, exist_ok=True)
+
+num_classes = 7
+
+lc_2000, profile = load_raster(os.path.join(input_dir, 'LC_2000.tif'))
+lc_2020, _ = load_raster(os.path.join(input_dir, 'LC_2020.tif'))
+
+# Load and normalize driving factors
+factor_files = ['dist_roads.tif', 'Pop_dens.tif', 'Slope.tif', 'elevation.tif']
+factors = [load_raster(os.path.join(input_dir, f))[0] for f in factor_files]
+driving_factors = np.stack(factors, axis=-1)
+
+scaler = MinMaxScaler()
+flat = driving_factors.reshape(-1, driving_factors.shape[-1])
+valid_mask = ~np.isnan(flat).any(axis=1)
+flat_scaled = np.zeros_like(flat)
+flat_scaled[valid_mask] = scaler.fit_transform(flat[valid_mask])
+driving_factors = flat_scaled.reshape(driving_factors.shape)
+
+# Transition matrix from 2000 to 2020
+trans_matrix = compute_transition_matrix(lc_2000, lc_2020, num_classes)
+class_trends = compute_class_change_trends(lc_2000, lc_2020, num_classes)
+print("\nClass Change Trends (2000 to 2020):")
+for i, trend in enumerate(class_trends, 1):
+    status = "increased" if trend > 0 else "decreased"
+    print(f"Class {i}: {status} ({trend*100:.2f}%)")
+trans_matrix = adjust_transition_matrix(trans_matrix, class_trends)
+
+# Run simulations
+future_years = [2040, 2060, 2080, 2100]
+steps = [20, 40, 60, 80]
+current_map = lc_2020
+simulated_maps = {2020: lc_2020}
+
+for step, year in zip(steps, future_years):
+    print(f"\n\u23f3 Simulating land cover for year {year}...")
+    sim_map = ca_markov_multiclass(
+        current_map, trans_matrix, driving_factors, num_classes,
+        iterations=int(step / 2)
+    )
+    out_path = os.path.join(output_dir, f'future_map_{year}.tif')
+    save_raster(out_path, sim_map, profile)
+    print(f"\u2705 Saved: {out_path}")
+    simulated_maps[year] = sim_map
+    current_map = sim_map
+
+# Compute changes between each simulation
+print("\nClass-wise change rates between simulation periods:")
+periods = [(2020, 2040), (2040, 2060), (2060, 2080), (2080, 2100)]
+for start, end in periods:
+    print(f"\nChange from {start} to {end}:")
+    compute_class_change(simulated_maps[start], simulated_maps[end], num_classes)
+
+def run_uncertainty_simulation(seed, lc_base, driving_factors, trans_matrix, num_classes, iterations=20):
+    np.random.seed(seed)
+    rf_seed = seed  
+
+  
+    def train_classifier_uncertain(driving_factors, lc_map, num_classes, rf_seed):
+        X = driving_factors.reshape(-1, driving_factors.shape[-1])
+        y = lc_map.flatten()
+
+        mask = ~np.isnan(X).any(axis=1) & ~np.isnan(y) & (y > 0)
+        X_train, y_train = X[mask], y[mask].astype(int)
+
+        rf = RandomForestClassifier(n_estimators=100, random_state=rf_seed)
+        rf.fit(X_train, y_train)
+
+        suitability_maps = []
+        pred_probs = rf.predict_proba(X[mask])
+
+        for class_id in range(1, num_classes + 1):
+            full_suit = np.full(y.shape, np.nan)
+            full_suit[mask] = pred_probs[:, class_id - 1]
+            suitability_maps.append(full_suit.reshape(lc_map.shape))
+
+        return np.stack(suitability_maps, axis=0)  
+
+    # Simulate CA-Markov with custom classifier
+    output = lc_base.copy()
+    kernel = np.ones((3, 3))
+    valid_mask = ~np.isnan(output)
+
+    for _ in range(iterations):
+        suitability_maps = train_classifier_uncertain(driving_factors, output, num_classes, rf_seed)
+
+        neighborhood_scores = np.zeros((num_classes, *output.shape))
+        for c in range(num_classes):
+            binary = (output == (c + 1)).astype(float)
+            convolved = convolve(binary, kernel, mode='nearest')
+            for target in range(num_classes):
+                neighborhood_scores[target] += convolved * trans_matrix[c, target]
+
+        total_score = neighborhood_scores * suitability_maps
+        total_score[1] *= 2.0  
+
+        new_classes = np.argmax(total_score, axis=0) + 1
+        output[valid_mask] = new_classes[valid_mask]
+
+    return output
+import numpy as np
+from tqdm import tqdm
+
+n_runs = 30
+future_year = 2040
+all_simulations = []
+
+print(f"\n🌀 Running Monte Carlo Uncertainty Simulation for year {future_year}...")
+
+for seed in tqdm(range(n_runs), desc="Uncertainty Runs"):
+    sim_map = run_uncertainty_simulation(
+        seed, lc_2020, driving_factors, trans_matrix, num_classes, iterations=10
+    )
+    all_simulations.append(sim_map)
+
+all_simulations = np.stack(all_simulations)  
+
+# === Compute per-pixel standard deviation ===
+std_map = np.std(all_simulations, axis=0)
+mean_map = np.mean(all_simulations, axis=0)
+
+# Save maps
+save_raster(os.path.join(output_dir, "uncertainty_std_2040.tif"), std_map, profile)
+save_raster(os.path.join(output_dir, "uncertainty_mean_2040.tif"), mean_map, profile)
+
+print("✅ Saved uncertainty maps (std, mean) for 2040.")
+import os
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+# === PARAMETERS ===
+n_runs = 30
+iterations = 10
+future_year = 2040  
+
+# === MONTE CARLO SIMULATION FUNCTION ===
+def run_uncertainty_simulation(seed, lc_map, driving_factors, trans_matrix, num_classes, iterations):
+    np.random.seed(seed)
+    perturbed_trans = trans_matrix + np.random.normal(0, 0.02, trans_matrix.shape)
+    perturbed_trans = np.clip(perturbed_trans, 0, 1)
+    perturbed_trans = perturbed_trans / perturbed_trans.sum(axis=1, keepdims=True)
+    
+    sim_map = ca_markov_multiclass(
+        initial_map=lc_map,
+        trans_matrix=perturbed_trans,
+        driving_factors=driving_factors,
+        num_classes=num_classes,
+        iterations=iterations
+    )
+    return sim_map
+
+# === MONTE CARLO RUN ===
+print(f"\n🌀 Running Monte Carlo Uncertainty Simulation for year {future_year}...")
+all_simulations = []
+
+for seed in tqdm(range(n_runs), desc="Uncertainty Runs"):
+    sim_map = run_uncertainty_simulation(
+        seed=seed,
+        lc_map=lc_2020,  
+        driving_factors=driving_factors,
+        trans_matrix=trans_matrix,
+        num_classes=num_classes,
+        iterations=iterations
+    )
+    all_simulations.append(sim_map)
+
+# === AGGREGATE UNCERTAINTY RESULTS ===
+uncertainty_stack = np.stack(all_simulations, axis=0)  
+
+# === CONVERT TO CSV ===
+csv_data = []
+for i in range(n_runs):
+    run_map = uncertainty_stack[i]
+    row = [i + 1]  # Simulation run ID
+    for c in range(1, num_classes + 1):
+        row.append(np.sum(run_map == c))
+    csv_data.append(row)
+
+columns = ["Simulation_Run"] + [f"Class_{c}" for c in range(1, num_classes + 1)]
+df = pd.DataFrame(csv_data, columns=columns)
+
+# === SAVE TO CSV ===
+uncertainty_csv_path = os.path.join(output_dir, f"uncertainty_class_counts_{future_year}.csv")
+df.to_csv(uncertainty_csv_path, index=False)
+
+print(f"\n✅ Saved uncertainty CSV: {uncertainty_csv_path}")
